@@ -87,7 +87,7 @@ class Tuning:
         self.s = {}
         self.total_memory = None
         self.prev_stats = None
-        self.metric = {}
+        self.metrics = {}
         self.config ={
             "db_name" : "postgres",
             "db_user": "postgres",
@@ -154,94 +154,128 @@ class Tuning:
         try:
             with conn.cursor() as cursor:
                 cursor.execute("""
-                    SELECT EXISTS(
-                        SELECT 1 FROM pg_extension 
-                        WHERE extname = 'pg_stat_statements'
-                    )
-                """)
-                if not cursor.fetchone()[0]:
-                    raise Exception("pg_stat_statements extension not enabled")
+                               SELECT 
+                                   SUM(xact_commit) AS commits,
+                                   SUM(xact_rollback) AS rollbacks,
+                                   SUM(tup_inserted) AS inserts,
+                                   SUM(tup_updated) AS updates,
+                                   SUM(tup_deleted) AS deletes,
+                                   SUM(tup_fetched) AS fetched,
+                                   SUM(tup_returned) AS returned,
+                                   SUM(temp_files) AS temp_files,
+                                   SUM(temp_bytes) AS temp_bytes,
+                                   EXTRACT(EPOCH FROM NOW() - pg_postmaster_start_time()) AS uptime
+                               FROM pg_stat_database
+                               WHERE datname = current_database()
+                           """)
+                db_stats = cursor.fetchone()
 
                 cursor.execute("""
-                    SELECT 
-                        SUM(calls) AS total_calls,
-                        SUM(total_exec_time) AS total_time,
-                        SUM(rows) AS total_rows,
-                        SUM(shared_blks_dirtied) AS writes,
-                        SUM(shared_blks_read) AS reads
-                    FROM pg_stat_statements
-                """)
-                stats = cursor.fetchone()
-
-                cursor.execute("""
-                    SELECT 
-                        COUNT(*) FILTER (WHERE state = 'active'),
-                        COUNT(*),
-                        EXTRACT(EPOCH FROM NOW() - MIN(backend_start)),
-                        SUM(temp_files) + SUM(temp_bytes)/1048576
-                    FROM pg_stat_activity
-                """)
+                               SELECT 
+                                   COUNT(*) FILTER (WHERE state = 'active') AS active_conn,
+                                   COUNT(*) FILTER (WHERE backend_type = 'client backend') AS total_conn,
+                                   MAX(EXTRACT(EPOCH FROM NOW() - query_start)) FILTER (WHERE state = 'active') AS max_query_time,
+                                   AVG(EXTRACT(EPOCH FROM NOW() - query_start)) FILTER (WHERE state = 'active') AS avg_query_time,
+                                   COUNT(*) FILTER (WHERE query ~* '\\y(JOIN|GROUP BY|WINDOW)\\y' AND state = 'active') AS complex_queries,
+                                   COUNT(*) FILTER (WHERE query ~* '\\y(INSERT|UPDATE|DELETE)\\y' AND state = 'active') AS write_queries,
+                                   COUNT(*) FILTER (WHERE wait_event_type = 'Lock' AND state = 'active') AS lock_wait
+                               FROM pg_stat_activity
+                               WHERE 
+                                   pid <> pg_backend_pid()
+                                   AND backend_type = 'client backend'
+                                   AND (state = 'active' OR state = 'idle')
+                           """)
                 activity_stats = cursor.fetchone()
 
-                total_ops = stats[0] or 1
-                total_time = stats[1] or 1
+                total_writes = db_stats[2] + db_stats[3] + db_stats[4]
+                total_reads = db_stats[5] + db_stats[6]
+                total_ops = total_writes + total_reads or 1
+                uptime = db_stats[9] or 1
 
-                self.metric = {
-                    'write_ratio': (stats[3] / (stats[3] + stats[4])) if (stats[3] + stats[4]) > 0 else 0,
-                    'read_ratio': stats[4] / (stats[3] + stats[4]) if (stats[3] + stats[4]) > 0 else 0,
-                    'complexity_score': (stats[1] / total_ops) * (stats[2] / total_ops),
-                    'transaction_rate': stats[0] / (activity_stats[2] or 1),
-                    'temp_usage': activity_stats[3],
-                    'active_connections': activity_stats[0],
-                    'cache_hit_ratio': (1 - (stats[4] / (stats[3] + stats[4]))) if (stats[3] + stats[4]) > 0 else 1
+                active_conn = activity_stats[0] or 0
+                total_conn = activity_stats[1] or 1
+                active_ratio = active_conn / total_conn if total_conn > 0 else 0
+
+                max_query_time = min(activity_stats[2] or 0, 3600)
+                avg_query_time = min(activity_stats[3] or 0, 300)
+
+                self.metrics = {
+                    'write_ratio': float(total_writes / total_ops),
+                    'read_ratio': float(total_reads / total_ops),
+                    'active_ratio': float(active_ratio),
+                    'conn_longevity': float(avg_query_time),
+                    'complexity_score': float(activity_stats[4] or 0),
+                    'temp_usage': float(db_stats[7] + (db_stats[8] / (1024 ** 2))),
+                    'lock_ratio': float(activity_stats[6] / active_conn) if active_conn > 0 else 0,
+                    'tps': float(db_stats[0] / uptime),
+                    'cache_hit_ratio': float(db_stats[5] / (db_stats[5] + db_stats[6])) if (db_stats[5] + db_stats[6]) > 0 else 0
                 }
+
+                for i in self.metrics.keys():
+                    print(i + ": " + str(self.metrics[i]))
 
         except Exception as e:
             print(f"Ошибка сбора метрик: {e}")
 
     def calculate_scores(self):
         weights = {
-            'OLAP': {
-                'complexity_score': 0.7,
-                'temp_usage': 0.8,
-                'read_ratio': 0.6,
-                'write_ratio': -0.5,
-                'transaction_rate': -0.3
-            },
             'OLTP': {
-                'write_ratio': 0.9,
-                'transaction_rate': 0.8,
-                'complexity_score': -0.7,
-                'cache_hit_ratio': 0.6
+            'write_ratio': 2.5,
+            'tps': 2.2,
+            'lock_ratio': 1.2,
+            'cache_hit_ratio': 0.8,
+            'conn_longevity': -0.7,
+            'complexity_score': -1.8
+            },
+            'OLAP': {
+                'complexity_score': 1.5,
+                'temp_usage': 1.3,
+                'read_ratio': 0.9,
+                'conn_longevity': 0.8,
+                'tps': -1.2,
+                'write_ratio': -1.5
             },
             'Web': {
-                'transaction_rate': 0.7,
-                'active_connections': 0.9,
-                'cache_hit_ratio': 0.8,
-                'complexity_score': -0.4
+                'active_ratio': 0.8,
+                'tps': 0.6,
+                'cache_hit_ratio': 1.0,
+                'conn_longevity': -1.2,
+                'complexity_score': -1.0,
+                'write_ratio': -0.9
             },
             'Desktop': {
-                'temp_usage': 0.6,
-                'complexity_score': 0.5,
-                'active_connections': -0.7,
-                'transaction_rate': 0.4
+                'conn_longevity': 1.2,
+                'complexity_score': 0.7,
+                'temp_usage': 0.5,
+                'active_ratio': -1.0,
+                'tps': -0.8
             }
         }
 
-        scores = {}
-        for load_type, coeffs in weights.items():
-            scores[load_type] = sum(
-                self.metric[metric] * weight
-                for metric, weight in coeffs.items()
-                if metric in self.metric
-            )
+        scores = {k: 0.0 for k in weights}
+        NORMALIZATION = {
+            'tps': lambda x: x/1000 if x < 5000 else 5.0,
+            'temp_usage': lambda x: (x/60) if x < 300 else 5.0,
+            'conn_longevity': lambda x: min(x / 3600, 2.0),
+            'complexity_score': lambda x: x/50 if x < 100 else 2.0,
+            'active_ratio': lambda x: x * 1.5 if x < 0.7 else 1.0,
+        }
 
-        scores['Mixed'] = (scores['OLAP'] + scores['OLTP']) / 2
+        for load_type in weights:
+            for metric, weight in weights[load_type].items():
+                raw_value = self.metrics.get(metric, 0)
+                if metric in NORMALIZATION:
+                    norm_value = NORMALIZATION[metric](raw_value)
+                else:
+                    norm_value = raw_value
+                scores[load_type] += norm_value * weight
 
-        for i in self.scores.keys():
-            print(i + " score: " + str(self.scores[i]))
+        scores['Mixed'] = (scores['OLTP'] + scores['OLAP']) * 0.3
 
-        return max(scores, key=scores.get)
+        print("\nМетрики:", {k: round(v, 2) for k, v in self.metrics.items()})
+        print("Оценки:", {k: round(v, 2) for k, v in scores.items()})
+
+        return max(scores, key=lambda k: scores[k])
 
     def get_postgres_load(self, options):
         try:
