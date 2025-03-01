@@ -171,20 +171,20 @@ class Tuning:
                 db_stats = cursor.fetchone()
 
                 cursor.execute("""
-                               SELECT 
-                                   COUNT(*) FILTER (WHERE state = 'active') AS active_conn,
-                                   COUNT(*) FILTER (WHERE backend_type = 'client backend') AS total_conn,
-                                   MAX(EXTRACT(EPOCH FROM NOW() - query_start)) FILTER (WHERE state = 'active') AS max_query_time,
-                                   AVG(EXTRACT(EPOCH FROM NOW() - query_start)) FILTER (WHERE state = 'active') AS avg_query_time,
-                                   COUNT(*) FILTER (WHERE query ~* '\\y(JOIN|GROUP BY|WINDOW)\\y' AND state = 'active') AS complex_queries,
-                                   COUNT(*) FILTER (WHERE query ~* '\\y(INSERT|UPDATE|DELETE)\\y' AND state = 'active') AS write_queries,
-                                   COUNT(*) FILTER (WHERE wait_event_type = 'Lock' AND state = 'active') AS lock_wait
-                               FROM pg_stat_activity
-                               WHERE 
-                                   pid <> pg_backend_pid()
-                                   AND backend_type = 'client backend'
-                                   AND (state = 'active' OR state = 'idle')
-                           """)
+                    SELECT 
+                        COUNT(*) FILTER (WHERE state = 'active') AS active_conn,
+                        COUNT(*) AS total_conn,
+                        MAX(EXTRACT(EPOCH FROM NOW() - query_start)) FILTER (WHERE state = 'active') AS max_query_time,
+                        AVG(EXTRACT(EPOCH FROM NOW() - query_start)) FILTER (WHERE state = 'active') AS avg_query_time,
+                        COUNT(*) FILTER (WHERE query ~* '(join|group by|window|with |select.*from|over )' AND state = 'active') AS complex_queries,
+                        COUNT(*) FILTER (WHERE query ~* '(insert|update|delete)' AND state = 'active') AS write_queries,
+                        COUNT(*) FILTER (WHERE wait_event_type = 'Lock' AND state = 'active') AS lock_wait
+                    FROM pg_stat_activity
+                    WHERE 
+                        pid <> pg_backend_pid()
+                        AND backend_type = 'client backend'
+                        AND (state = 'active' OR state LIKE 'idle%')
+                """)
                 activity_stats = cursor.fetchone()
 
                 total_writes = db_stats[2] + db_stats[3] + db_stats[4]
@@ -220,20 +220,21 @@ class Tuning:
     def calculate_scores(self):
         weights = {
             'OLTP': {
-            'write_ratio': 2.5,
-            'tps': 2.2,
-            'lock_ratio': 1.2,
-            'cache_hit_ratio': 0.8,
-            'conn_longevity': -0.7,
-            'complexity_score': -1.8
+                'write_ratio': 3.0,  # Увеличено влияние
+                'tps': 2.5,
+                'lock_ratio': 1.5,
+                'cache_hit_ratio': 1.2,
+                'conn_longevity': -1.0,
+                'complexity_score': -2.0,
+                'temp_usage': -0.5  # Добавлен отрицательный вес
             },
             'OLAP': {
-                'complexity_score': 1.5,
-                'temp_usage': 1.3,
-                'read_ratio': 0.9,
-                'conn_longevity': 0.8,
-                'tps': -1.2,
-                'write_ratio': -1.5
+                'complexity_score': 1.2,  # Уменьшено влияние
+                'temp_usage': 0.8,
+                'read_ratio': 0.7,
+                'conn_longevity': 0.6,
+                'tps': -1.5,  # Усилено отрицательное влияние
+                'write_ratio': -2.0  # Усилено отрицательное влияние
             },
             'Web': {
                 'active_ratio': 0.8,
@@ -252,14 +253,15 @@ class Tuning:
             }
         }
 
-        scores = {k: 0.0 for k in weights}
         NORMALIZATION = {
-            'tps': lambda x: x/1000 if x < 5000 else 5.0,
-            'temp_usage': lambda x: (x/60) if x < 300 else 5.0,
-            'conn_longevity': lambda x: min(x / 3600, 2.0),
-            'complexity_score': lambda x: x/50 if x < 100 else 2.0,
-            'active_ratio': lambda x: x * 1.5 if x < 0.7 else 1.0,
+            'tps': lambda x: min(x / 500, 3.0),  # Более агрессивная нормализация
+            'temp_usage': lambda x: (x / 1000) if x < 5000 else 2.0,  # Увеличен порог
+            'conn_longevity': lambda x: min(x / 1800, 1.5),  # 30 минут макс
+            'complexity_score': lambda x: x / 20 if x < 50 else 2.5,
+            'active_ratio': lambda x: x * 2 if x < 0.5 else 1.0,
         }
+
+        scores = {k: 0.0 for k in weights}
 
         for load_type in weights:
             for metric, weight in weights[load_type].items():
