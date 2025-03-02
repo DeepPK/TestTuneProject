@@ -2,7 +2,6 @@ import math
 import sys
 import argparse
 import numpy as np
-from sklearn.preprocessing import MinMaxScaler, StandardScaler
 import collections
 
 import psycopg2
@@ -152,22 +151,22 @@ class Tuning:
 
     def collect_metrics(self, conn):
         try:
-            with conn.cursor() as cursor:
+            with conn.cursor() as cursor: #соединение с бд
                 cursor.execute("""
-                               SELECT 
-                                   SUM(xact_commit) AS commits,
-                                   SUM(xact_rollback) AS rollbacks,
-                                   SUM(tup_inserted) AS inserts,
-                                   SUM(tup_updated) AS updates,
-                                   SUM(tup_deleted) AS deletes,
-                                   SUM(tup_fetched) AS fetched,
-                                   SUM(tup_returned) AS returned,
-                                   SUM(temp_files) AS temp_files,
-                                   SUM(temp_bytes) AS temp_bytes,
-                                   EXTRACT(EPOCH FROM NOW() - pg_postmaster_start_time()) AS uptime
-                               FROM pg_stat_database
-                               WHERE datname = current_database()
-                           """)
+                   SELECT 
+                       SUM(xact_commit) AS commits,
+                       SUM(xact_rollback) AS rollbacks,
+                       SUM(tup_inserted) AS inserts,
+                       SUM(tup_updated) AS updates,
+                       SUM(tup_deleted) AS deletes,
+                       SUM(tup_fetched) AS fetched,
+                       SUM(tup_returned) AS returned,
+                       SUM(temp_files) AS temp_files,
+                       SUM(temp_bytes) AS temp_bytes,
+                       EXTRACT(EPOCH FROM NOW() - pg_postmaster_start_time()) AS uptime
+                   FROM pg_stat_database
+                   WHERE datname = current_database()
+               """)
                 db_stats = cursor.fetchone()
 
                 cursor.execute("""
@@ -205,7 +204,7 @@ class Tuning:
                     'active_ratio': float(active_ratio),
                     'conn_longevity': float(avg_query_time),
                     'complexity_score': float(activity_stats[4] or 0),
-                    'temp_usage': float(db_stats[7] + (db_stats[8] / (1024 ** 2))),
+                    'temp_usage': float((db_stats[8] / (1024 ** 2))),
                     'lock_ratio': float(activity_stats[6] / active_conn) if active_conn > 0 else 0,
                     'tps': float(db_stats[0] / uptime),
                     'cache_hit_ratio': float(db_stats[5] / (db_stats[5] + db_stats[6])) if (db_stats[5] + db_stats[6]) > 0 else 0
@@ -220,21 +219,21 @@ class Tuning:
     def calculate_scores(self):
         weights = {
             'OLTP': {
-                'write_ratio': 3.0,  # Увеличено влияние
-                'tps': 2.5,
+                'write_ratio': 3.0,
+                'tps': 3.0,
                 'lock_ratio': 1.5,
                 'cache_hit_ratio': 1.2,
                 'conn_longevity': -1.0,
                 'complexity_score': -2.0,
-                'temp_usage': -0.5  # Добавлен отрицательный вес
+                'temp_usage': -0.5
             },
             'OLAP': {
-                'complexity_score': 1.2,  # Уменьшено влияние
+                'complexity_score': 1.2,
                 'temp_usage': 0.8,
                 'read_ratio': 0.7,
                 'conn_longevity': 0.6,
-                'tps': -1.5,  # Усилено отрицательное влияние
-                'write_ratio': -2.0  # Усилено отрицательное влияние
+                'tps': -1.5,
+                'write_ratio': -2.0
             },
             'Web': {
                 'active_ratio': 0.8,
@@ -254,9 +253,9 @@ class Tuning:
         }
 
         NORMALIZATION = {
-            'tps': lambda x: min(x / 500, 3.0),  # Более агрессивная нормализация
-            'temp_usage': lambda x: (x / 1000) if x < 5000 else 2.0,  # Увеличен порог
-            'conn_longevity': lambda x: min(x / 1800, 1.5),  # 30 минут макс
+            'tps': lambda x: min(x / 500, 3.0),
+            'temp_usage': lambda x: (x / 1000) if x < 5000 else 2.0,
+            'conn_longevity': lambda x: min(x / 1800, 1.5),
             'complexity_score': lambda x: x / 20 if x < 50 else 2.5,
             'active_ratio': lambda x: x * 2 if x < 0.5 else 1.0,
         }
@@ -274,7 +273,7 @@ class Tuning:
 
         scores['Mixed'] = (scores['OLTP'] + scores['OLAP']) * 0.3
 
-        print("\nМетрики:", {k: round(v, 2) for k, v in self.metrics.items()})
+        #print("\nМетрики:", {k: round(v, 2) for k, v in self.metrics.items()})
         print("Оценки:", {k: round(v, 2) for k, v in scores.items()})
 
         return max(scores, key=lambda k: scores[k])
