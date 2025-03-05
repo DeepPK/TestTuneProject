@@ -271,7 +271,7 @@ class Tuning:
                     norm_value = raw_value
                 scores[load_type] += norm_value * weight
 
-        scores['Mixed'] = (scores['OLTP'] + scores['OLAP']) * 0.3
+        scores['Mixed'] = (scores['OLTP'] + scores['OLAP']) * 0.6
 
         #print("\nМетрики:", {k: round(v, 2) for k, v in self.metrics.items()})
         print("Оценки:", {k: round(v, 2) for k, v in scores.items()})
